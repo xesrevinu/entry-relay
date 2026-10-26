@@ -83,6 +83,24 @@ pub async fn serve_on(
     Ok(())
 }
 
+async fn read_preface(tls: &mut tokio_rustls::server::TlsStream<TcpStream>) -> Vec<u8> {
+    let mut buf = vec![0u8; FRAME_LEN];
+    let mut filled = 0;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while filled < FRAME_LEN {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        match timeout(left, tls.read(&mut buf[filled..])).await {
+            Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
+            Ok(Ok(n)) => filled += n,
+        }
+    }
+    buf.truncate(filled);
+    buf
+}
+
 async fn handle(sock: TcpStream, peer: SocketAddr, shared: Arc<Shared>) -> anyhow::Result<()> {
     crate::mux::tune(&sock);
     let mut tls = match timeout(Duration::from_secs(8), shared.acceptor.accept(sock)).await {
@@ -91,25 +109,24 @@ async fn handle(sock: TcpStream, peer: SocketAddr, shared: Arc<Shared>) -> anyho
     };
     let mut exporter = [0u8; 32];
     tls.get_ref().1.export_keying_material(&mut exporter, auth::LABEL, None)?;
-    let mut frame = [0u8; FRAME_LEN];
-    if timeout(Duration::from_secs(5), tls.read_exact(&mut frame)).await.is_err() {
-        let _ = tls.write_all(auth::DECOY).await;
-        return Ok(());
-    }
-    let now = SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
-    let purpose = match auth::verify(&shared.psk, &exporter, &frame, now, 120) {
-        Ok(purpose) => purpose,
-        Err(()) => {
-            let _ = tls.write_all(auth::DECOY).await;
-            return Ok(());
+    let preface = read_preface(&mut tls).await;
+    let now = SystemTime::now();
+    let now_secs = now.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+    let purpose = if preface.len() == FRAME_LEN { auth::verify(&shared.psk, &exporter, &preface, now_secs, 120).ok() } else { None };
+    let Some(purpose) = purpose else {
+        if let Some(page) = auth::public_http_response(&preface, now) {
+            let _ = tls.write_all(&page).await;
         }
+        return Ok(());
     };
     if purpose == PURPOSE_PING {
         tls.write_all(&[STATUS_OK]).await?;
         return Ok(());
     }
     if purpose != PURPOSE_OPEN && purpose != PURPOSE_MUX2 {
-        let _ = tls.write_all(auth::DECOY).await;
+        if let Some(page) = auth::public_http_response(&preface, now) {
+            let _ = tls.write_all(&page).await;
+        }
         return Ok(());
     }
     if shared.used.load(Ordering::Relaxed) >= shared.quota_bytes {

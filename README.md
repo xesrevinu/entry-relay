@@ -15,4 +15,4 @@ nix shell nixpkgs#zig nixpkgs#cargo-zigbuild -c sh -c 'for t in aarch64-unknown-
 cargo test --release
 ```
 
-Relay addresses, the allowlist, the certificate name, and the listen port are config. They are not compiled in. `entry-relay gen-cert` defaults the certificate name to `relay.example`.
+Relay addresses, the allowlist, the certificate name, and the listen port are config. They are not compiled in. `entry-relay gen-cert` writes a 90-day self-signed certificate whose common name is the name you pass (default `relay.example`). A connection that does not authenticate, and that speaks ordinary HTTP, gets a short page. Anything else is closed.

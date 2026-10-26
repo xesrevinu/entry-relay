@@ -1,7 +1,11 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use rcgen::{CertificateParams, KeyPair};
+use std::io::Read;
+use std::time::SystemTime;
+
+use rcgen::{CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, KeyPair, KeyUsagePurpose, SerialNumber};
+use time::{Duration, OffsetDateTime};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::ring::default_provider;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
@@ -132,7 +136,22 @@ pub fn client_config(pin: [u8; 32]) -> Arc<ClientConfig> {
 pub fn write_self_signed(dir: &Path, name: &str) -> anyhow::Result<[u8; 32]> {
     std::fs::create_dir_all(dir)?;
     let key = KeyPair::generate()?;
-    let params = CertificateParams::new(vec![name.to_string()])?;
+    let mut params = CertificateParams::new(vec![name.to_string()])?;
+    let mut dn = DistinguishedName::new();
+    dn.push(DnType::CommonName, name);
+    params.distinguished_name = dn;
+    let now = OffsetDateTime::from(SystemTime::now()).replace_nanosecond(0).unwrap_or(OffsetDateTime::UNIX_EPOCH);
+    params.not_before = now;
+    params.not_after = now + Duration::days(90);
+    params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+    params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+    let mut serial = [0u8; 8];
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut serial)?;
+    serial[0] &= 0x7f;
+    if serial == [0u8; 8] {
+        serial[7] = 1;
+    }
+    params.serial_number = Some(SerialNumber::from(u64::from_be_bytes(serial)));
     let cert = params.self_signed(&key)?;
     std::fs::write(dir.join("cert.pem"), cert.pem())?;
     std::fs::write(dir.join("key.pem"), key.serialize_pem())?;
