@@ -1,0 +1,42 @@
+[package]
+name = "entry-net"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "TLS entry relay and a localhost SOCKS balancer"
+
+[[bin]]
+name = "entry-relay"
+path = "src/bin/entry-relay.rs"
+
+[[bin]]
+name = "entry-balance"
+path = "src/bin/entry-balance.rs"
+
+[dependencies]
+anyhow = "1"
+libc = "0.2"
+clap = { version = "4", features = ["derive"] }
+hmac = "0.12"
+rcgen = { version = "0.13", default-features = false, features = ["pem", "ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls-pemfile = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+socket2 = { version = "0.6", default-features = false, features = ["all"] }
+tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std", "env-filter", "ansi"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "time"] }
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = true
+opt-level = 3
+panic = "abort"
