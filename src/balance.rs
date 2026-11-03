@@ -61,8 +61,8 @@ struct Live {
 struct Slot {
     dial: Mutex<()>,
     current: std::sync::RwLock<Option<Arc<Session>>>,
-    /// TCP+TLS+auth time of the current session (~3 RTT). Per-flow path RTT
-    /// is fixed for the life of a TCP, so this ranks sessions by path.
+    /// Path RTT of the current session (handshake estimate / TCP_INFO srtt).
+    /// Per-flow path RTT is fixed for the life of a TCP, so this ranks sessions by path.
     dial_ms: AtomicU64,
 }
 
@@ -248,6 +248,35 @@ async fn ping_slot(shared: &Shared, relay: &Live, index: usize) -> anyhow::Resul
         session.close();
         return Err(err);
     }
+    // Idle session stuck on a slow per-flow path: drop it so keep_slot redials.
+    // Never kick while streams or queued DATA are present.
+    let (limit, _) = rtt_reject();
+    let dial_ms = relay.slots[index].dial_ms.load(Ordering::Relaxed);
+    if limit > 0 && dial_ms > limit {
+        let fastest = relay
+            .slots
+            .iter()
+            .filter(|slot| slot.get().is_some())
+            .map(|slot| slot.dial_ms.load(Ordering::Relaxed))
+            .min()
+            .unwrap_or(0);
+        if dial_ms > fastest.saturating_mul(2) && session.active() == 0 && session.queued() == 0 {
+            warn!(
+                relay = %relay.cfg.name,
+                slot = index,
+                dial_ms,
+                fastest_ms = fastest,
+                limit_ms = limit,
+                "idle slow-path session, redialing"
+            );
+            let mut cur = relay.slots[index].current.write().unwrap();
+            if cur.as_ref().is_some_and(|s| Arc::ptr_eq(s, &session)) {
+                *cur = None;
+            }
+            drop(cur);
+            session.close();
+        }
+    }
     Ok(())
 }
 
@@ -260,9 +289,10 @@ async fn ensure_slot(shared: &Shared, relay: &Live, index: usize) -> anyhow::Res
     if let Some(session) = slot.get() {
         return Ok(session);
     }
-    let started = Instant::now();
-    let session = dial_mux_checked(&shared.psk, relay, shared.window, index).await?;
-    slot.dial_ms.store(started.elapsed().as_millis() as u64, Ordering::Relaxed);
+    let (session, rtt) = dial_mux_checked(&shared.psk, relay, shared.window, index).await?;
+    // Path RTT from the handshake (not wall-clock dial time): reject backoff
+    // must not pollute pick_session's slow ranking.
+    slot.dial_ms.store(rtt, Ordering::Relaxed);
     *slot.current.write().unwrap() = Some(Arc::clone(&session));
     Ok(session)
 }
@@ -361,14 +391,27 @@ async fn pick_session(shared: &Arc<Shared>, relay: &Arc<Live>, skip: &[Arc<Sessi
 
 /// Parallel dials per slot. On a per-flow ECMP path a new 5-tuple can stick
 /// to a slow route for the life of the TCP, and SYNs are sometimes lost
-/// (Linux initial SYN RTO is 1 s). The first finished TCP+TLS+auth handshake
-/// is kept; the others are dropped.
+/// (Linux initial SYN RTO is 1 s). After the first finished TCP+TLS+auth
+/// handshake, a short gather window collects other finishers and the lowest
+/// path RTT wins; losers are closed. `ENTRY_DIAL_GATHER_MS=0` restores
+/// first-finisher-wins.
 pub const DIAL_RACE: usize = 3;
+/// Default gather window after the first raced dial succeeds (ms).
+pub const DIAL_GATHER_MS: u64 = 80;
 
 /// `ENTRY_DIAL_RACE` / `ENTRY_HEDGE_MS` override the defaults (lab A/B; 1 and 0 disable).
 fn dial_race() -> usize {
     static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *V.get_or_init(|| std::env::var("ENTRY_DIAL_RACE").ok().and_then(|v| v.parse().ok()).unwrap_or(DIAL_RACE))
+}
+
+/// `ENTRY_DIAL_GATHER_MS` overrides `DIAL_GATHER_MS` (0 = first success wins).
+fn dial_gather() -> Duration {
+    static V: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        let ms = std::env::var("ENTRY_DIAL_GATHER_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(DIAL_GATHER_MS);
+        Duration::from_millis(ms)
+    })
 }
 
 fn hedge_after() -> Option<Duration> {
@@ -395,7 +438,7 @@ fn rtt_reject() -> (u64, u32) {
     })
 }
 
-/// Outcome of one slow-path check round, kept pure for tests.
+/// Outcome of one slow-path / gather check, kept pure for tests. Closes the loser.
 fn keep_better(best: Option<(Arc<Session>, u64)>, next: (Arc<Session>, u64)) -> (Arc<Session>, u64) {
     match best {
         Some(b) if b.1 <= next.1 => {
@@ -410,12 +453,34 @@ fn keep_better(best: Option<(Arc<Session>, u64)>, next: (Arc<Session>, u64)) -> 
     }
 }
 
+/// Fold raced finishers into the lowest-RTT survivor; every loser is closed.
+fn gather_best(
+    mut best: Option<(Arc<Session>, u64)>,
+    finishers: impl IntoIterator<Item = (Arc<Session>, u64)>,
+) -> Option<(Arc<Session>, u64)> {
+    for next in finishers {
+        best = Some(keep_better(best.take(), next));
+    }
+    best
+}
+
+/// Abort remaining raced dials and close any that still finished (no leak).
+async fn close_race_losers(set: &mut tokio::task::JoinSet<anyhow::Result<(Arc<Session>, u64)>>) {
+    set.abort_all();
+    while let Some(rest) = set.join_next().await {
+        if let Ok(Ok((extra, _))) = rest {
+            extra.close();
+        }
+    }
+}
+
 /// Dial, and if the session's path RTT (handshake estimate, plus TCP_INFO
 /// srtt on Linux) exceeds the threshold, redial on a fresh source port.
 /// Bounded: at most 1 + retries rounds with 100/200/400.. ms backoff, only
 /// under the slot's dial lock. If every round is slow (or a retry fails),
 /// the best session seen is kept rather than failing the slot.
-async fn dial_mux_checked(psk: &[u8], relay: &Live, window: u32, index: usize) -> anyhow::Result<Arc<Session>> {
+/// Returns the kept session and its path RTT (for `slot.dial_ms`).
+async fn dial_mux_checked(psk: &[u8], relay: &Live, window: u32, index: usize) -> anyhow::Result<(Arc<Session>, u64)> {
     let (limit, retries) = rtt_reject();
     let mut best: Option<(Arc<Session>, u64)> = None;
     for round in 0..=retries {
@@ -427,7 +492,7 @@ async fn dial_mux_checked(psk: &[u8], relay: &Live, window: u32, index: usize) -
                 let rtt = got.1;
                 let b = keep_better(best.take(), got);
                 if limit == 0 || rtt <= limit {
-                    return Ok(b.0);
+                    return Ok(b);
                 }
                 warn!(relay = %relay.cfg.name, slot = index, rtt_ms = rtt, limit_ms = limit, round, "slow path session, redialing");
                 best = Some(b);
@@ -441,9 +506,13 @@ async fn dial_mux_checked(psk: &[u8], relay: &Live, window: u32, index: usize) -
     }
     let (session, rtt) = best.expect("at least one round succeeded");
     info!(relay = %relay.cfg.name, slot = index, rtt_ms = rtt, "all redials slow, keeping best");
-    Ok(session)
+    Ok((session, rtt))
 }
 
+/// Race `dial_race()` dials. The first success starts a gather window
+/// (`dial_gather()`); among finishers in that window the lowest path RTT is
+/// kept via `keep_better`, and every other session is closed. Gather of 0 ms
+/// keeps first-finisher-wins (abort the rest immediately).
 async fn dial_mux_raced(psk: &[u8], relay: &Live, window: u32) -> anyhow::Result<(Arc<Session>, u64)> {
     let mut set = tokio::task::JoinSet::new();
     for _ in 0..dial_race().max(1) {
@@ -453,17 +522,33 @@ async fn dial_mux_raced(psk: &[u8], relay: &Live, window: u32) -> anyhow::Result
         set.spawn(async move { dial_mux_parts(&psk, &cfg, pin, window).await });
     }
     let mut last = None;
+    let gather = dial_gather();
     while let Some(res) = set.join_next().await {
         match res {
-            Ok(Ok(session)) => {
-                set.abort_all();
-                // A loser that finished in the same instant must not leak.
-                while let Some(rest) = set.join_next().await {
-                    if let Ok(Ok((extra, _))) = rest {
-                        extra.close();
+            Ok(Ok(got)) => {
+                let mut finishers = vec![got];
+                if !gather.is_zero() {
+                    let deadline = tokio::time::Instant::now() + gather;
+                    loop {
+                        match tokio::time::timeout_at(deadline, set.join_next()).await {
+                            Ok(Some(res)) => match res {
+                                Ok(Ok(got)) => finishers.push(got),
+                                Ok(Err(err)) => {
+                                    if err.is::<OverQuota>() {
+                                        relay.used.store(relay.cfg.quota_bytes, Ordering::Relaxed);
+                                    }
+                                    // Already have a finisher; gather errors only matter if
+                                    // we somehow return none (we do not).
+                                    let _ = err;
+                                }
+                                Err(_) => {}
+                            },
+                            Ok(None) | Err(_) => break,
+                        }
                     }
                 }
-                return Ok(session);
+                close_race_losers(&mut set).await;
+                return Ok(gather_best(None, finishers).expect("at least one finisher"));
             }
             Ok(Err(err)) => {
                 if err.is::<OverQuota>() {
@@ -720,5 +805,55 @@ fn persist(shared: &Shared) {
     let tmp = shared.state.with_extension("json.tmp");
     if std::fs::write(&tmp, body).is_ok() {
         let _ = std::fs::rename(tmp, &shared.state);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Peer half must be kept alive: dropping it EOFs the session.
+    fn dummy_session() -> (Arc<Session>, tokio::io::DuplexStream) {
+        let (ours, peer) = tokio::io::duplex(64 * 1024);
+        let (r, w) = tokio::io::split(ours);
+        (mux::adopt(r, w, 64 * 1024), peer)
+    }
+
+    #[tokio::test]
+    async fn keep_better_prefers_lower_rtt() {
+        let (slow, _ps) = dummy_session();
+        let (fast, _pf) = dummy_session();
+        let (winner, rtt) = keep_better(Some((Arc::clone(&slow), 80)), (Arc::clone(&fast), 40));
+        assert_eq!(rtt, 40);
+        assert!(Arc::ptr_eq(&winner, &fast));
+        assert!(!slow.alive());
+        assert!(fast.alive());
+        winner.close();
+    }
+
+    #[tokio::test]
+    async fn keep_better_keeps_equal_incumbent() {
+        let (a, _pa) = dummy_session();
+        let (b, _pb) = dummy_session();
+        let (winner, rtt) = keep_better(Some((Arc::clone(&a), 40)), (Arc::clone(&b), 40));
+        assert_eq!(rtt, 40);
+        assert!(Arc::ptr_eq(&winner, &a));
+        assert!(a.alive());
+        assert!(!b.alive());
+        winner.close();
+    }
+
+    #[tokio::test]
+    async fn gather_best_picks_lowest_and_closes_losers() {
+        let (a, _pa) = dummy_session();
+        let (b, _pb) = dummy_session();
+        let (c, _pc) = dummy_session();
+        let winner = gather_best(None, [(Arc::clone(&a), 90), (Arc::clone(&b), 35), (Arc::clone(&c), 50)]).expect("winner");
+        assert_eq!(winner.1, 35);
+        assert!(Arc::ptr_eq(&winner.0, &b));
+        assert!(!a.alive());
+        assert!(b.alive());
+        assert!(!c.alive());
+        winner.0.close();
     }
 }
