@@ -37,9 +37,20 @@ struct Shared {
     psk: Vec<u8>,
     quota_bytes: u64,
     state: PathBuf,
+    period: std::sync::Mutex<String>,
     used: Arc<AtomicU64>,
     window: u32,
     acceptor: TlsAcceptor,
+}
+
+fn roll_usage(shared: &Shared, now: SystemTime) -> Usage {
+    let key = crate::usage::period_key(now);
+    let mut period = shared.period.lock().unwrap();
+    if *period != key {
+        shared.used.store(0, Ordering::Relaxed);
+        *period = key.clone();
+    }
+    Usage { period: key, bytes: shared.used.load(Ordering::Relaxed) }
 }
 
 pub async fn serve(config: RelayConfig, bound: oneshot::Sender<SocketAddr>) -> anyhow::Result<()> {
@@ -63,6 +74,7 @@ pub async fn serve_on(
         psk,
         quota_bytes: config.quota_bytes,
         state: config.state,
+        period: std::sync::Mutex::new(usage.period),
         used: Arc::new(AtomicU64::new(usage.bytes)),
         window: mux::clamp_window(config.window_kb),
         acceptor: TlsAcceptor::from(server),
@@ -129,15 +141,15 @@ async fn handle(sock: TcpStream, peer: SocketAddr, shared: Arc<Shared>) -> anyho
         }
         return Ok(());
     }
-    if shared.used.load(Ordering::Relaxed) >= shared.quota_bytes {
+    if roll_usage(&shared, now).bytes >= shared.quota_bytes {
         tls.write_all(&[STATUS_QUOTA]).await?;
         return Ok(());
     }
     if purpose == PURPOSE_MUX2 {
         tls.write_all(&[STATUS_OK]).await?;
         mux::serve(tls, shared.upstream.clone(), Arc::clone(&shared.used), shared.window).await?;
-        let used = shared.used.load(Ordering::Relaxed);
-        let usage = Usage { period: crate::usage::period_key(SystemTime::now()), bytes: used };
+        let usage = roll_usage(&shared, SystemTime::now());
+        let used = usage.bytes;
         if let Err(err) = usage.store(&shared.state) {
             warn!(%err, "failed to store relay usage");
         }
@@ -160,9 +172,10 @@ async fn handle(sock: TcpStream, peer: SocketAddr, shared: Arc<Shared>) -> anyho
     let up = copy_count(up_r, client_w, Arc::clone(&counter));
     let _ = tokio::try_join!(down, up);
     let bytes = counter.load(Ordering::Relaxed);
+    let _ = roll_usage(&shared, SystemTime::now());
     let used = shared.used.fetch_add(bytes, Ordering::Relaxed) + bytes;
     let usage = Usage {
-        period: crate::usage::period_key(SystemTime::now()),
+        period: shared.period.lock().unwrap().clone(),
         bytes: used,
     };
     if let Err(err) = usage.store(&shared.state) {

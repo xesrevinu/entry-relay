@@ -488,11 +488,13 @@ async fn write_loop<W>(
     let mut write = BufWriter::with_capacity(BATCH, write);
     loop {
         let mut batch = 0usize;
+        let mut saw_ctrl = false;
         tokio::select! {
             biased;
             frame = ctrl_rx.recv() => {
                 let Some(frame) = frame else { break };
                 batch += frame.len();
+                saw_ctrl = true;
                 if write.write_all(&frame).await.is_err() { break; }
             }
             frame = data_rx.recv() => {
@@ -508,6 +510,7 @@ async fn write_loop<W>(
             match ctrl_rx.try_recv() {
                 Ok(frame) => {
                     batch += frame.len();
+                    saw_ctrl = true;
                     if write.write_all(&frame).await.is_err() {
                         return;
                     }
@@ -515,6 +518,14 @@ async fn write_loop<W>(
                 Err(mpsc::error::TryRecvError::Empty) => break,
                 Err(mpsc::error::TryRecvError::Disconnected) => return,
             }
+        }
+        // OPEN/OK/PING must not share a TLS record with 256 KB of DATA.
+        // Under load that delay was 2–6 s and x.com hung after CONNECT.
+        if saw_ctrl {
+            if write.flush().await.is_err() {
+                break;
+            }
+            continue;
         }
         while batch < BATCH {
             if let Ok((frame, _permit)) = data_rx.try_recv() {

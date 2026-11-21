@@ -215,7 +215,10 @@ pub async fn master(listener: std::net::TcpListener) -> anyhow::Result<()> {
                 if let Some(pid) = worker.id() {
                     signal_pid(pid, libc::SIGQUIT);
                 }
-                let _ = tokio::time::timeout(drain_grace(), worker.wait()).await;
+                if tokio::time::timeout(drain_grace(), worker.wait()).await.is_err() {
+                    warn!("worker drain timed out on shutdown, killing worker");
+                    let _ = worker.kill().await;
+                }
                 info!("master exiting");
                 return Ok(());
             }

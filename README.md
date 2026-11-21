@@ -7,6 +7,7 @@ The balancer keeps a few long-lived TLS 1.3 mux sessions to one or more relays. 
 - Credit window per stream and direction (default 4MB). The TLS writer applies backpressure from that budget.
 - Dead sessions: TCP keepalive (15s/5s×3) plus `TCP_USER_TIMEOUT` 30s. The balancer PINGs every 2s and redials a slot after 8s with no inbound frame. The relay closes a session after 90s with no inbound frame.
 - The process is a master. The worker accepts. `SIGUSR2` stops new accepts and drains in-flight streams (`ENTRY_DRAIN_SECS`, default 30).
+- Loopback HTTP on the SOCKS port (first byte is not 0x05): `GET /delay`, `/group/entry-balance/delay`, `/status`. Measures mux OPEN RTT, not an external URL. OPEN/OK/PING flush immediately and do not share a TLS record with DATA.
 - Release builds are static musl: `lto=fat`, `opt-level=3`, `panic=abort`, stripped.
 
 ```bash
