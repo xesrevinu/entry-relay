@@ -179,3 +179,48 @@ async fn silent_peer_kills_session() {
     assert!(!session.alive());
     assert!(took >= std::time::Duration::from_secs(7) && took <= std::time::Duration::from_secs(12), "{took:?}");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn idle_streams_do_not_starve_send_budget() {
+    // Upstream accepts connections and waits for a 9-byte request.
+    let up = upstream().await;
+    // Single mux session: SEND_BUDGET is 1 MiB and READ_CHUNK is 64 KiB, so 24
+    // idle streams would permanently exhaust SEND_BUDGET if permits were
+    // acquired before `reader.read()`.
+    let socks = stack(up, 1, None).await;
+    let mut idle = Vec::new();
+    for _ in 0..24 {
+        let mut s = TcpStream::connect(socks).await.unwrap();
+        s.write_all(&[5, 1, 0]).await.unwrap();
+        let mut m = [0u8; 2];
+        s.read_exact(&mut m).await.unwrap();
+        let p = up.port().to_be_bytes();
+        s.write_all(&[5, 1, 0, 1, 127, 0, 0, 1, p[0], p[1]]).await.unwrap();
+        let mut r = [0u8; 10];
+        s.read_exact(&mut r).await.unwrap();
+        assert_eq!(r[1], 0);
+        idle.push(s);
+    }
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    // /status must report queued == 0 while all 24 streams are idle.
+    let mut http = TcpStream::connect(socks).await.unwrap();
+    http.write_all(b"GET /status HTTP/1.1\r\nHost: localhost\r\n\r\n").await.unwrap();
+    let mut resp = String::new();
+    http.read_to_string(&mut resp).await.unwrap();
+    let body = resp.split("\r\n\r\n").nth(1).unwrap();
+    let status: serde_json::Value = serde_json::from_str(body).unwrap();
+    let slot = &status["relays"][0]["slots"][0];
+    assert_eq!(slot["active"].as_u64(), Some(24), "status: {body}");
+    assert_eq!(slot["queued"].as_u64(), Some(0), "idle streams must hold 0 send budget: {body}");
+
+    // A 25th active stream must transfer cleanly without starving on SEND_BUDGET.
+    let len = 512 * 1024;
+    let s = request(socks, up, 9, len as u64).await;
+    let got = tokio::time::timeout(Duration::from_secs(10), read_all(s))
+        .await
+        .expect("25th stream starved behind 24 idle streams");
+    assert_eq!(got.len(), len);
+    assert_eq!(got, pattern(len, 16));
+    drop(idle);
+}

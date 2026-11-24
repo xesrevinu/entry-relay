@@ -1,6 +1,6 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -64,6 +64,23 @@ struct Slot {
     /// Path RTT of the current session (handshake estimate / TCP_INFO srtt).
     /// Per-flow path RTT is fixed for the life of a TCP, so this ranks sessions by path.
     dial_ms: AtomicU64,
+    /// Consecutive probes where live TCP_INFO showed high loss or degraded RTT.
+    bad_probes: AtomicU32,
+}
+
+/// Retransmission ratio (permille) above which a slot is deprioritized.
+const LOSS_DEGRADED_PM: u64 = 50;
+/// Sustained retransmission ratio (permille) above which a slot is gracefully retired.
+const LOSS_RETIRE_PM: u64 = 80;
+
+fn slot_rtt_ms(slot: &Slot, session: &Session) -> u64 {
+    let live = session.live_rtt_ms();
+    if live > 0 { live } else { slot.dial_ms.load(Ordering::Relaxed) }
+}
+
+fn rank_dial() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("ENTRY_RANK_DIAL").map(|v| v != "0").unwrap_or(true))
 }
 
 impl Slot {
@@ -111,7 +128,12 @@ pub async fn serve_on(
                 rtt_ms: RwLock::new(None),
                 up: RwLock::new(true),
                 slots: (0..sessions)
-                    .map(|_| Slot { dial: Mutex::new(()), current: std::sync::RwLock::new(None), dial_ms: AtomicU64::new(0) })
+                    .map(|_| Slot {
+                        dial: Mutex::new(()),
+                        current: std::sync::RwLock::new(None),
+                        dial_ms: AtomicU64::new(0),
+                        bad_probes: AtomicU32::new(0),
+                    })
                     .collect(),
                 rr: AtomicUsize::new(0),
             }))
@@ -151,6 +173,7 @@ pub async fn serve_on(
         });
     }
     gate.wait_idle().await;
+    persist(&shared);
     Ok(())
 }
 
@@ -190,7 +213,7 @@ async fn probe_loop(shared: Arc<Shared>, every: Duration) {
     }
 }
 
-async fn probe_once(shared: &Shared) {
+async fn probe_once(shared: &Arc<Shared>) {
     rollover_if_needed(shared, SystemTime::now());
     for relay in &shared.relays {
         match ping_relay(shared, relay).await {
@@ -209,7 +232,7 @@ async fn probe_once(shared: &Shared) {
 /// Healthy if at least one slot answers. Each slot is pinged and redialed
 /// independently; a dead slot never takes the others down. Returns the lowest
 /// observed path RTT across healthy slots (not the sum of sequential pings).
-async fn ping_relay(shared: &Shared, relay: &Live) -> anyhow::Result<u32> {
+async fn ping_relay(shared: &Arc<Shared>, relay: &Arc<Live>) -> anyhow::Result<u32> {
     let mut last = None;
     let mut ok = false;
     let mut best_ping: Option<u32> = None;
@@ -240,8 +263,68 @@ async fn ping_relay(shared: &Shared, relay: &Live) -> anyhow::Result<u32> {
     }
 }
 
-async fn ping_slot(shared: &Shared, relay: &Live, index: usize) -> anyhow::Result<Option<u32>> {
+async fn ping_slot(shared: &Arc<Shared>, relay: &Arc<Live>, index: usize) -> anyhow::Result<Option<u32>> {
     let session = ensure_slot(shared, relay, index).await?;
+    let slot = &relay.slots[index];
+    // Evaluate live TCP_INFO health even while streams are active: if a single
+    // slot degrades into a high-loss or slow path while at least one healthy
+    // sibling exists, gracefully retire it (existing streams finish intact)
+    // and dial a fresh replacement in the background.
+    let (limit, _) = rtt_reject();
+    let live_rtt = slot_rtt_ms(slot, &session);
+    let loss_pm = session.loss_permille();
+    let fastest = relay
+        .slots
+        .iter()
+        .filter_map(|s| s.get().map(|sess| (s, sess)))
+        .filter(|(_, sess)| sess.loss_permille() < LOSS_DEGRADED_PM)
+        .map(|(s, sess)| slot_rtt_ms(s, &sess))
+        .filter(|ms| *ms > 0)
+        .min()
+        .unwrap_or(0);
+    let cap = rtt_cap(limit, fastest);
+    let degraded = loss_pm >= LOSS_RETIRE_PM || (cap > 0 && live_rtt > cap);
+    let healthy_others = relay
+        .slots
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != index)
+        .filter_map(|(_, s)| s.get().map(|sess| (s, sess)))
+        .filter(|(s, sess)| {
+            sess.loss_permille() < LOSS_DEGRADED_PM && (cap == 0 || slot_rtt_ms(s, sess) <= cap)
+        })
+        .count();
+    if degraded && healthy_others > 0 {
+        let strikes = slot.bad_probes.fetch_add(1, Ordering::Relaxed) + 1;
+        if strikes >= 2 {
+            warn!(
+                relay = %relay.cfg.name,
+                slot = index,
+                live_rtt_ms = live_rtt,
+                loss_pm = session.local_loss_permille(),
+                peer_loss_pm = session.peer_loss_permille(),
+                fastest_ms = fastest,
+                limit_ms = cap,
+                active = session.active(),
+                "degraded mux slot, retiring and redialing"
+            );
+            slot.bad_probes.store(0, Ordering::Relaxed);
+            let mut cur = slot.current.write().unwrap();
+            if cur.as_ref().is_some_and(|s| Arc::ptr_eq(s, &session)) {
+                *cur = None;
+            }
+            drop(cur);
+            session.retire_within(Duration::from_secs(20));
+            let shared = Arc::clone(shared);
+            let relay = Arc::clone(relay);
+            tokio::spawn(async move {
+                let _ = ensure_slot(&shared, &relay, index).await;
+            });
+            return Ok(None);
+        }
+    } else {
+        slot.bad_probes.store(0, Ordering::Relaxed);
+    }
     // OPEN/PING share the TLS writer with DATA. A 5s pong wait on a session
     // that is already copying only stalls probe_loop; liveness is the
     // heartbeat (DEAD_AFTER of inbound silence).
@@ -280,17 +363,7 @@ async fn ping_slot(shared: &Shared, relay: &Live, index: usize) -> anyhow::Resul
     let ping_rtt = u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX);
     // Idle session stuck on a slow per-flow path: drop it so keep_slot redials.
     // Never kick while streams or queued DATA are present.
-    let (limit, _) = rtt_reject();
     let dial_ms = relay.slots[index].dial_ms.load(Ordering::Relaxed);
-    let fastest = relay
-        .slots
-        .iter()
-        .filter(|slot| slot.get().is_some())
-        .map(|slot| slot.dial_ms.load(Ordering::Relaxed))
-        .filter(|ms| *ms > 0)
-        .min()
-        .unwrap_or(0);
-    let cap = rtt_cap(limit, fastest);
     if cap > 0 && dial_ms > cap && session.active() == 0 && session.queued() == 0 {
         warn!(
             relay = %relay.cfg.name,
@@ -323,6 +396,7 @@ async fn ensure_slot(shared: &Shared, relay: &Live, index: usize) -> anyhow::Res
     // Path RTT from the handshake (not wall-clock dial time): reject backoff
     // must not pollute pick_session's slow ranking.
     slot.dial_ms.store(rtt, Ordering::Relaxed);
+    slot.bad_probes.store(0, Ordering::Relaxed);
     *slot.current.write().unwrap() = Some(Arc::clone(&session));
     Ok(session)
 }
@@ -373,16 +447,30 @@ async fn pick_session(shared: &Arc<Shared>, relay: &Arc<Live>, skip: &[Arc<Sessi
     // Rotation gives ties (everything idle and empty) to the next slot, so a
     // batch of parallel bulk streams still spreads across the pool.
     let start = relay.rr.fetch_add(1, Ordering::Relaxed) % n;
-    // A session dialed on the slow per-flow path (dial time > 2x the best
-    // live one) is only used when every fast one is busy.
-    let fastest = relay
-        .slots
-        .iter()
-        .filter(|slot| slot.get().is_some())
-        .map(|slot| slot.dial_ms.load(Ordering::Relaxed))
-        .min()
-        .filter(|_| std::env::var("ENTRY_RANK_DIAL").map(|v| v != "0").unwrap_or(true))
-        .unwrap_or(0);
+    // A session on a slow per-flow path (live/dial RTT > 2x best) or with
+    // elevated TCP retransmissions is only used when every healthy one is busy.
+    let fastest = if rank_dial() {
+        let healthy_min = relay
+            .slots
+            .iter()
+            .filter_map(|slot| slot.get().map(|s| (slot, s)))
+            .filter(|(_, s)| s.loss_permille() < LOSS_DEGRADED_PM)
+            .map(|(slot, s)| slot_rtt_ms(slot, &s))
+            .filter(|ms| *ms > 0)
+            .min();
+        healthy_min
+            .or_else(|| {
+                relay
+                    .slots
+                    .iter()
+                    .filter_map(|slot| slot.get().map(|s| slot_rtt_ms(slot, &s)))
+                    .filter(|ms| *ms > 0)
+                    .min()
+            })
+            .unwrap_or(0)
+    } else {
+        0
+    };
     let mut best: Option<((u8, u8, u8, usize, usize), Arc<Session>)> = None;
     for step in 0..n {
         let index = (start + step) % n;
@@ -390,7 +478,8 @@ async fn pick_session(shared: &Arc<Shared>, relay: &Arc<Live>, skip: &[Arc<Sessi
         match slot.get() {
             Some(s) if skip.iter().any(|skipped| Arc::ptr_eq(skipped, &s)) => {}
             Some(s) => {
-                let slow = fastest > 0 && slot.dial_ms.load(Ordering::Relaxed) > fastest * 2;
+                let rtt = slot_rtt_ms(slot, &s);
+                let slow = (fastest > 0 && rtt > fastest * 2) || s.loss_permille() >= LOSS_DEGRADED_PM;
                 // Route first, then queue. backlog-before-slow (2026-10-21)
                 // dumped every new OPEN — including mihomo health checks —
                 // onto the 97 ms sessions the moment the 35 ms one carried
@@ -609,18 +698,8 @@ async fn connect_pinned(addr: &str) -> std::io::Result<TcpStream> {
         let socket = if target.is_ipv6() { tokio::net::TcpSocket::new_v6()? } else { tokio::net::TcpSocket::new_v4()? };
         #[cfg(target_os = "linux")]
         if target.is_ipv6() {
-            let off: libc::c_int = 0;
-            // SAFETY: valid fd, option value is a c_int.
-            unsafe {
-                use std::os::fd::AsRawFd;
-                libc::setsockopt(
-                    socket.as_raw_fd(),
-                    libc::IPPROTO_IPV6,
-                    70, // IPV6_AUTOFLOWLABEL
-                    &off as *const _ as *const libc::c_void,
-                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-                );
-            }
+            use std::os::fd::AsRawFd;
+            mux::pin_v6_flowlabel(socket.as_raw_fd());
         }
         match socket.connect(target).await {
             Ok(stream) => return Ok(stream),
@@ -684,7 +763,11 @@ async fn dial_mux_parts(psk: &[u8], cfg: &RelayConfig, pin: [u8; 32], window: u3
         rtt = rtt.max(srtt);
     }
     let (read, write) = tokio::io::split(tls);
-    Ok((mux::adopt(read, write, window), rtt))
+    #[cfg(target_os = "linux")]
+    let session = mux::adopt_with_probe(read, write, window, move || mux::tcp_sample(fd));
+    #[cfg(not(target_os = "linux"))]
+    let session = mux::adopt(read, write, window);
+    Ok((session, rtt))
 }
 
 use rustls::pki_types::ServerName;
@@ -769,13 +852,20 @@ impl Shared {
                     slots.push(',');
                 }
                 let session = slot.get();
-                let (alive, active, queued) = match &session {
-                    Some(s) => (true, s.active(), s.queued()),
-                    None => (false, 0, 0),
+                let (alive, active, queued, live_rtt, loss_pm, peer_loss_pm) = match &session {
+                    Some(s) => (
+                        true,
+                        s.active(),
+                        s.queued(),
+                        s.live_rtt_ms(),
+                        s.local_loss_permille(),
+                        s.peer_loss_permille(),
+                    ),
+                    None => (false, 0, 0, 0, 0, 0),
                 };
                 let dial = slot.dial_ms.load(Ordering::Relaxed);
                 slots.push_str(&format!(
-                    "{{\"i\":{j},\"dial_ms\":{dial},\"alive\":{alive},\"active\":{active},\"queued\":{queued}}}"
+                    "{{\"i\":{j},\"dial_ms\":{dial},\"live_rtt_ms\":{live_rtt},\"loss_pm\":{loss_pm},\"peer_loss_pm\":{peer_loss_pm},\"alive\":{alive},\"active\":{active},\"queued\":{queued}}}"
                 ));
             }
             slots.push(']');
@@ -829,7 +919,6 @@ async fn handle_socks(mut sock: TcpStream, shared: Arc<Shared>) -> anyhow::Resul
                     let bytes = pipe.copy(sock).await;
                     rollover_if_needed(&shared, SystemTime::now());
                     relay.used.fetch_add(bytes, Ordering::Relaxed);
-                    persist(&shared);
                     info!(relay = %relay.cfg.name, bytes, open_ms = opened_at.elapsed().as_millis() as u64, "balanced session finished");
                     return Ok(());
                 }
@@ -1100,6 +1189,7 @@ mod tests {
                     dial: Mutex::new(()),
                     current: std::sync::RwLock::new(Some(sess)),
                     dial_ms: AtomicU64::new(40),
+                    bad_probes: AtomicU32::new(0),
                 }
             })
             .collect();
@@ -1118,7 +1208,7 @@ mod tests {
             slots,
             rr: AtomicUsize::new(0),
         });
-        let shared = Shared {
+        let shared = Arc::new(Shared {
             psk: Vec::new(),
             max_rtt_ms: 150,
             allow: Vec::new(),
@@ -1126,7 +1216,7 @@ mod tests {
             period: std::sync::Mutex::new(crate::usage::period_key(SystemTime::now())),
             relays: vec![Arc::clone(&relay)],
             window: 64 * 1024,
-        };
+        });
         probe_once(&shared).await;
         assert!(*relay.up.read().await);
         let rtt = relay.rtt_ms.read().await.expect("rtt recorded");

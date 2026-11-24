@@ -147,6 +147,16 @@ async fn handle(sock: TcpStream, peer: SocketAddr, shared: Arc<Shared>) -> anyho
     }
     if purpose == PURPOSE_MUX2 {
         tls.write_all(&[STATUS_OK]).await?;
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd;
+            let fd = tls.get_ref().0.as_raw_fd();
+            mux::serve_with_probe(tls, shared.upstream.clone(), Arc::clone(&shared.used), shared.window, move || {
+                mux::tcp_sample(fd)
+            })
+            .await?;
+        }
+        #[cfg(not(target_os = "linux"))]
         mux::serve(tls, shared.upstream.clone(), Arc::clone(&shared.used), shared.window).await?;
         let usage = roll_usage(&shared, SystemTime::now());
         let used = usage.bytes;

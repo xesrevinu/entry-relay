@@ -15,7 +15,9 @@ path = "src/bin/entry-balance.rs"
 
 [dependencies]
 anyhow = "1"
+bytes = "1"
 libc = "0.2"
+mimalloc = { version = "0.1", default-features = false }
 clap = { version = "4", features = ["derive"] }
 hmac = "0.12"
 rcgen = { version = "0.13", default-features = false, features = ["pem", "ring"] }
