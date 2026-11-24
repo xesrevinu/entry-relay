@@ -325,7 +325,7 @@ async fn ping_slot(shared: &Arc<Shared>, relay: &Arc<Live>, index: usize) -> any
     } else {
         slot.bad_probes.store(0, Ordering::Relaxed);
     }
-    // OPEN/PING share the TLS writer with DATA. A 5s pong wait on a session
+    // OPEN/PING share the TLS writer with DATA. Waiting out a pong on a session
     // that is already copying only stalls probe_loop; liveness is the
     // heartbeat (DEAD_AFTER of inbound silence).
     if session.queued() > 0 || session.active() > 0 {
@@ -335,8 +335,8 @@ async fn ping_slot(shared: &Arc<Shared>, relay: &Arc<Live>, index: usize) -> any
     if let Err(err) = session.ping().await {
         // A pong that misses the timeout is not proof of death: on a session
         // that is still delivering data it only means the writer had to drain
-        // its queue first (1 MB send budget plus the kernel send queue on a
-        // slow path). The heartbeat already declares a session dead after
+        // its queue first (the send budget plus the kernel send queue on a
+        // high-latency path). The heartbeat already declares a session dead after
         // DEAD_AFTER of silence, so replacing a busy-but-alive session only
         // leaks its socket: its data keeps flowing and its heartbeats keep it
         // alive on the relay, forever.
@@ -406,7 +406,7 @@ async fn ensure_slot(shared: &Shared, relay: &Live, index: usize) -> anyhow::Res
 /// while dials fail.
 async fn keep_slot(shared: Arc<Shared>, relay: Arc<Live>, index: usize) {
     // Stagger the first dial so later slots see a live fastest-RTT and can
-    // reject the 97 ms ECMP bucket instead of all four racing blind.
+    // reject a much slower path instead of all racing blind.
     if index > 0 {
         tokio::time::sleep(Duration::from_millis(80 * index as u64)).await;
     }
@@ -432,17 +432,17 @@ async fn keep_slot(shared: Arc<Shared>, relay: Arc<Live>, index: usize) {
 ///
 /// Least-loaded stacking put a whole burst on one TCP congestion window.
 /// Plain round-robin still lands one of every N opens on the session that is
-/// already draining a video. An idle warm session costs one RTT (~40 ms on
-/// the home path); the busy one costs that plus whatever DATA is in flight.
+/// already draining a bulk transfer. An idle warm session costs one RTT; the
+/// busy one costs that plus whatever DATA is in flight.
 /// Dead slots are redialed in the background.
 async fn pick_session(shared: &Arc<Shared>, relay: &Arc<Live>, skip: &[Arc<Session>]) -> anyhow::Result<Arc<Session>> {
     // Freshness first (a silent session may be half dead), then the DATA still
     // waiting for that session's TLS writer, then stream count.
     //
-    // Stream count alone says nothing about latency: a video stream is one
-    // stream and a multi-megabyte queue. A burst has more streams than
-    // sessions, so "prefer an idle session" runs out of idle sessions; the
-    // remainder must not be queued behind a download.
+    // Stream count alone says nothing about latency: one bulk stream can fill
+    // a multi-megabyte queue. A burst has more streams than sessions, so
+    // "prefer an idle session" runs out of idle sessions; the remainder must
+    // not be queued behind a download.
     let n = relay.slots.len();
     // Rotation gives ties (everything idle and empty) to the next slot, so a
     // batch of parallel bulk streams still spreads across the pool.
@@ -480,11 +480,9 @@ async fn pick_session(shared: &Arc<Shared>, relay: &Arc<Live>, skip: &[Arc<Sessi
             Some(s) => {
                 let rtt = slot_rtt_ms(slot, &s);
                 let slow = (fastest > 0 && rtt > fastest * 2) || s.loss_permille() >= LOSS_DEGRADED_PM;
-                // Route first, then queue. backlog-before-slow (2026-10-21)
-                // dumped every new OPEN — including mihomo health checks —
-                // onto the 97 ms sessions the moment the 35 ms one carried
-                // a video. A 35 ms TCP with a few hundred KB queued is
-                // still faster than an idle 97 ms path.
+                // Prefer a fast path over a short queue. Putting every new OPEN
+                // onto the slow sessions whenever the fast one is busy is worse:
+                // a fast TCP with some data queued still beats an idle slow path.
                 let key = rank_key(s.fresh(), slow, s.queued(), s.active());
                 if best.as_ref().map(|(k, _)| key < *k).unwrap_or(true) {
                     best = Some((key, s));
@@ -513,8 +511,8 @@ async fn pick_session(shared: &Arc<Shared>, relay: &Arc<Live>, skip: &[Arc<Sessi
 }
 
 /// Parallel dials per slot. On a per-flow ECMP path a new 5-tuple can stick
-/// to a slow route for the life of the TCP, and SYNs are sometimes lost
-/// (Linux initial SYN RTO is 1 s). After the first finished TCP+TLS+auth
+/// to a high-latency route for the life of the TCP, and SYNs are sometimes lost.
+/// The retransmit wait is long next to a low-latency path. After the first finished TCP+TLS+auth
 /// handshake, a short gather window collects other finishers and the lowest
 /// path RTT wins; losers are closed. `ENTRY_DIAL_GATHER_MS=0` restores
 /// first-finisher-wins.
@@ -546,7 +544,8 @@ fn hedge_after() -> Option<Duration> {
 }
 
 /// Default per-session path RTT above which a fresh session is dropped and
-/// redialed on a new source port (the 226 ms per-flow path; 35/97 pass).
+/// redialed on a new source port. A high-latency per-flow path is rejected;
+/// a low-latency path is kept.
 pub const RTT_REJECT_MS: u64 = 150;
 /// Extra dial rounds after a slow one. Each round is itself `dial_race()` wide.
 pub const RTT_RETRIES: u32 = 3;
@@ -599,7 +598,7 @@ async fn close_race_losers(set: &mut tokio::task::JoinSet<anyhow::Result<(Arc<Se
 
 /// Dial, and if the session's path RTT (handshake estimate, plus TCP_INFO
 /// srtt on Linux) exceeds the threshold, redial on a fresh source port.
-/// Bounded: at most 1 + retries rounds with 100/200/400.. ms backoff, only
+/// Bounded: at most 1 + retries rounds with exponential backoff, only
 /// under the slot's dial lock. If every round is slow (or a retry fails),
 /// the best session seen is kept rather than failing the slot.
 /// Returns the kept session and its path RTT (for `slot.dial_ms`).
@@ -785,8 +784,8 @@ async fn dispatch(sock: TcpStream, shared: Arc<Shared>) -> anyhow::Result<()> {
 }
 
 impl Shared {
-    /// Mux OPEN RTT on the session a SOCKS CONNECT would use. Does not fetch
-    /// an external URL (the allow list would reject gstatic anyway).
+    /// Mux OPEN RTT on the session a SOCKS CONNECT would use.
+    /// Does not fetch an external URL.
     pub(crate) async fn delay_ms(self: &Arc<Self>, budget: Duration) -> Option<u32> {
         let start = Instant::now();
         let mut order = choose(self).await;
@@ -938,8 +937,7 @@ async fn handle_socks(mut sock: TcpStream, shared: Arc<Shared>) -> anyhow::Resul
     anyhow::bail!("no usable relay");
 }
 
-/// A quiet mux session that loses the OPEN segment waits for TLP/RTO
-/// (prod: rto 243-490 ms, observed OPENs of 0.8-1.9 s on a 40 ms path).
+/// A quiet mux session that loses the OPEN segment waits for TLP/RTO.
 /// If no OK arrives within HEDGE_AFTER, send a second OPEN on another session
 /// and keep whichever answers first; the loser's Pipe drop sends CLOSE.
 /// Queued bytes above which a session counts as busy for OPEN placement.
@@ -959,8 +957,7 @@ fn fastest_other(relay: &Live, except: usize) -> u64 {
         .unwrap_or(0)
 }
 
-/// Absolute cap, or 2× the best already-live slot (so 97 ms is rejected
-/// once any slot has the 35 ms bucket).
+/// Absolute cap, or 2× the best already-live slot, whichever is lower.
 fn rtt_cap(limit: u64, fastest_other: u64) -> u64 {
     if limit == 0 {
         0
@@ -975,8 +972,8 @@ fn accept_rtt(rtt: u64, cap: u64) -> bool {
     cap == 0 || rtt <= cap
 }
 
-/// Lower is better. `slow` outranks `backlog` so a busy 35 ms session
-/// keeps winning against an idle 97 ms one.
+/// Lower is better. `slow` outranks `backlog`, so a busy fast session
+/// keeps winning against an idle slow one.
 fn rank_key(fresh: bool, slow: bool, queued: usize, active: usize) -> (u8, u8, u8, usize, usize) {
     (
         u8::from(!fresh),
@@ -1195,7 +1192,7 @@ mod tests {
             .collect();
         let relay = Arc::new(Live {
             cfg: RelayConfig {
-                name: "hk-th-1".into(),
+                name: "relay-a".into(),
                 addr: "127.0.0.1:1".into(),
                 sni: "relay.example".into(),
                 pin_sha256: "00".repeat(32),
@@ -1220,7 +1217,7 @@ mod tests {
         probe_once(&shared).await;
         assert!(*relay.up.read().await);
         let rtt = relay.rtt_ms.read().await.expect("rtt recorded");
-        assert!(rtt <= 150, "4 sequential ~40ms pings should not sum over 150ms (got {rtt}ms)");
+        assert!(rtt <= 150, "sequential slot pings must not be summed (got {rtt}ms)");
         let picked = pick(
             vec![Candidate { index: 0, remaining: 1_000_000, rtt_ms: Some(rtt) }],
             0,
@@ -1239,13 +1236,13 @@ mod tests {
     fn rank_prefers_busy_fast_over_idle_slow() {
         let fast_busy = rank_key(true, false, BACKLOG_BYTES + 1, 5);
         let slow_idle = rank_key(true, true, 0, 0);
-        assert!(fast_busy < slow_idle, "35ms + video must beat idle 97ms");
+        assert!(fast_busy < slow_idle, "busy fast session must beat an idle slow one");
         let fast_idle = rank_key(true, false, 0, 0);
         assert!(fast_idle < fast_busy);
     }
 
     #[test]
-    fn relative_rtt_cap_rejects_97ms_once_35ms_exists() {
+    fn relative_rtt_cap_rejects_slow_once_fast_exists() {
         assert!(accept_rtt(98, rtt_cap(150, 0)));
         assert!(!accept_rtt(98, rtt_cap(150, 38)));
         assert!(accept_rtt(38, rtt_cap(150, 38)));
@@ -1265,7 +1262,7 @@ mod tests {
         assert_ne!(oct_key, nov_key);
         let relay = Arc::new(Live {
             cfg: RelayConfig {
-                name: "hk-th-1".into(),
+                name: "relay-a".into(),
                 addr: "127.0.0.1:1".into(),
                 sni: "relay.example".into(),
                 pin_sha256: "00".repeat(32),
@@ -1290,7 +1287,7 @@ mod tests {
         persist_at(&shared, nov);
         assert_eq!(relay.used.load(Ordering::Relaxed), 0);
         assert_eq!(*shared.period.lock().unwrap(), nov_key);
-        assert_eq!(load_relay_used(&state, "hk-th-1", &nov_key), 0);
+        assert_eq!(load_relay_used(&state, "relay-a", &nov_key), 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -1,7 +1,7 @@
 //! Slow-path rejects, keep-best and dial-race losers must close their TCP.
-//! Every flow through the link is ~200 ms RTT (> ENTRY_RTT_REJECT_MS=150), so
-//! each slot rejects 3 rounds of 3 racing dials and keeps the best one. Before
-//! the fix the 32 discarded sessions per slot stayed open on heartbeat.
+//! Every flow through the link is high latency, above the reject threshold, so
+//! each slot rejects several rounds of racing dials and keeps the best one. Before
+//! the fix the discarded sessions per slot stayed open on heartbeat.
 
 use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener as StdListener, TcpStream as StdStream};

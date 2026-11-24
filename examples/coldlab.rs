@@ -8,8 +8,9 @@
 //!     rto (ordered pipe, so later chunks wait too: head-of-line).
 //!
 //!   coldlab <opens> <gap_ms> [rtt_fast rtt_slow p_slow p_syn syn_rto p_loss rto]
-//! Defaults: 40 226 0.5 0.35 1000 0.03 300.
-//! A/B with ENTRY_DIAL_RACE=1 ENTRY_HEDGE_MS=0 (old behaviour) vs defaults.
+//! Defaults are one low-latency path and one high-latency path, with occasional
+//! lost SYNs and tail loss. A/B with ENTRY_DIAL_RACE=1 ENTRY_HEDGE_MS=0
+//! (old behaviour) vs defaults.
 
 use std::io::{Read, Write};
 use std::net::Shutdown;
@@ -125,7 +126,7 @@ fn spawn_link(right: SocketAddr, net: Net, slow_flows: Arc<AtomicU64>) -> Socket
     addr
 }
 
-/// `LAB_PATHS=35,97,226`: per-source-port hashed paths instead of p_slow.
+/// `LAB_PATHS`: comma-separated one-way delays, hashed by source port, instead of p_slow.
 fn paths() -> Option<Vec<f64>> {
     let v: Vec<f64> = std::env::var("LAB_PATHS").ok()?.split(',').filter_map(|x| x.trim().parse().ok()).collect();
     (!v.is_empty()).then_some(v)
@@ -261,7 +262,7 @@ async fn main() {
                 let mut b = [0u8; 1];
                 if s.read_exact(&mut b).await.is_ok() {
                     let ms = t.elapsed().as_secs_f64() * 1000.0;
-                    // open + echo ~ 2 RTT: 226 ms path => ~450 ms, 97 => ~200.
+                    // open + echo is about two RTTs; count the high-latency ones.
                     if ms > 400.0 {
                         slow_opens += 1;
                     }

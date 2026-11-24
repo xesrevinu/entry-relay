@@ -5,7 +5,7 @@
 //! Flow control, per stream and per direction:
 //! * The sender starts with `BASE_CREDIT` bytes. The receiver immediately
 //!   grants `window - BASE_CREDIT` more, so each side picks its own receive
-//!   window (default 4 MiB, enough for ~160 Mbps at 200 ms RTT).
+//!   window (default 4 MiB), large enough that a high-latency path can still fill the link.
 //! * The receiver returns credit (WINDOW frame) only after the bytes were
 //!   written to the local socket, batched in steps of `window / 8`.
 //! * The session reader never blocks on a stream: inbound queues are
@@ -742,8 +742,8 @@ async fn write_loop<W>(
                 Err(mpsc::error::TryRecvError::Disconnected) => return,
             }
         }
-        // OPEN/OK/PING must not share a TLS record with 256 KB of DATA.
-        // Under load that delay was 2–6 s and x.com hung after CONNECT.
+        // OPEN/OK/PING must not share a TLS record with a large DATA batch.
+        // Otherwise a new stream waits behind the bytes already queued.
         if saw_ctrl {
             if write.flush().await.is_err() {
                 break;

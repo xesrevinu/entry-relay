@@ -1,9 +1,7 @@
 //! Loopback HTTP on the SOCKS port (first byte is not 0x05).
 //!
-//! Mihomo's `/group/{name}/delay` only exists for url-test / fallback /
-//! load-balance groups. `entry-balance` is a socks5 proxy, so that path 404s
-//! on :9090. Hitting this port instead measures mux OPEN RTT — the hop we
-//! actually own — without fetching an external URL through the allow list.
+//! `GET /delay`, `/proxies/entry-balance/delay`, and `/group/entry-balance/delay`
+//! report mux OPEN RTT. They do not fetch an external URL.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -152,8 +150,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_clash_delay_paths() {
-        match parse_request("GET /delay?url=http://www.gstatic.com/generate_204&timeout=3000 HTTP/1.1") {
+    fn parses_delay_paths() {
+        match parse_request("GET /delay?timeout=3000 HTTP/1.1") {
             Route::Delay { timeout } => assert_eq!(timeout, Duration::from_millis(3000)),
             _ => panic!("delay"),
         }
@@ -183,11 +181,11 @@ mod tests {
     }
 
     #[test]
-    fn clash_json_shapes() {
+    fn json_shapes() {
         let body = delay_body(Some(38));
         assert!(body.contains("{\"delay\":38}"));
-        let group = group_body(&[("hk-th-1".into(), 41)]);
-        assert!(group.contains("{\"hk-th-1\":41}"));
+        let group = group_body(&[("relay-a".into(), 41)]);
+        assert!(group.contains("{\"relay-a\":41}"));
         assert!(group.starts_with("HTTP/1.1 200"));
         assert!(group_body(&[]).starts_with("HTTP/1.1 504"));
         assert!(not_found().contains("Resource not found"));
